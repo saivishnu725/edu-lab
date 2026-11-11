@@ -4,6 +4,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/io.h>
+#include <linux/iopoll.h> 
 
 #define EDU_BAR             0           // I/O memory, 1 MB in size. Users are supposed to communicate with the card through this memory
 #define EDU_REG_ID          0x00        // specs says device version and identifier stays in this register
@@ -11,6 +12,10 @@
 #define EDU_LIVENESS_INPUT  0x12345678  // random value
 #define EDU_VENDOR_ID 0x1234
 #define EDU_DEVICE_ID 0x11e8
+#define EDU_REG_FACTORIAL  0x08
+#define EDU_REG_STATUS     0x20
+#define EDU_STATUS_BUSY    0x01
+
 
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     // probe order/flow: enable -> hold from others -> map
@@ -18,6 +23,8 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	u32 device_id;
 	u32 liveness;
 	int ret;
+    u32 status;
+    u32 factorial;
 
     // prepare the device for use
 	ret = pci_enable_device(pdev);
@@ -58,8 +65,28 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	dev_info(&pdev->dev, "liveness: wrote 0x%08x, read 0x%08x\n",
 		 EDU_LIVENESS_INPUT, liveness);
 
+
+    // 0x08 (RW)factorial computation
+    // The stored value is taken and factorial of it is put back here. This happens only after factorial bit in the status register (0x20 below) is cleared.
+    iowrite32(5, bar + EDU_REG_FACTORIAL);
+
+    // check status
+	ret = readl_poll_timeout(bar + EDU_REG_STATUS, status,
+				 !(status & EDU_STATUS_BUSY),
+				 100, 1000000);
+	if (ret) {
+		dev_err(&pdev->dev, "factorial calculation timed out\n");
+		goto unmap_bar;
+	}
+
+    // read the factorial
+	factorial = ioread32(bar + EDU_REG_FACTORIAL);
+	dev_info(&pdev->dev, "factorial: 5! = %u\n", factorial);
+
 	return 0;
 
+unmap_bar:
+    pci_iounmap(pdev, bar);
 release_region:
 	pci_release_region(pdev, EDU_BAR);
 disable_device:

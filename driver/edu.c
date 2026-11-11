@@ -24,15 +24,23 @@
 #define EDU_REG_IRQ_STATUS     0x24  // tells us which interrupt was raised
 #define EDU_REG_IRQ_ACK        0x64  // write interrupt bits here to acknowledge them
 #define EDU_IRQ_FACTORIAL      0x01  // factorial completion interrupt bit
-#define EDU_DMA_BUF_SIZE  64  // bytes in our first DMA buffer
+#define EDU_DMA_BUF_SIZE  64         // bytes in our first DMA buffer
+#define EDU_REG_DMA_SRC    0x80      // source address
+#define EDU_REG_DMA_DST    0x88      // destination address
+#define EDU_REG_DMA_COUNT  0x90      // number of bytes
+#define EDU_REG_DMA_CMD    0x98      // start and direction
+#define EDU_DMA_START      0x01      // start transfer; stays set while busy
+#define EDU_DMA_TO_RAM     0x02      // direction: device buffer -> guest RAM
+#define EDU_DMA_DEVICE_BUF 0x40000   // address of edu's internal buffer
 
 // data for one edu device, shared by probe, interrupt handler and remove
 struct edu_device {
 	void __iomem *bar;                 // mapped BAR0; use bar + offset to access registers
 	struct completion factorial_done;  // lets probe wait for factorial to finish
 	int irq;                           // Linux IRQ number assigned to the device
-    void *dma_buf;           // CPU pointer for accessing the buffer
-	dma_addr_t dma_handle;   // DMA address to give to the device
+    void *dma_buf;                     // CPU pointer for accessing the buffer
+	dma_addr_t dma_handle;             // DMA address to give to the device
+    bool dma_stuck;                    // don't free the DMA buffer if a transfer timed out
 };
 
 // kernel calls this fn in an interrupt thread
@@ -55,6 +63,30 @@ static irqreturn_t edu_irq_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static int edu_dma_transfer(struct edu_device *edu, bool to_ram) {
+	u32 command;
+	u32 status;
+
+	// select source and destination for the requested direction
+	if (to_ram) {
+		iowrite32(EDU_DMA_DEVICE_BUF, edu->bar + EDU_REG_DMA_SRC);
+		iowrite32((u32)edu->dma_handle, edu->bar + EDU_REG_DMA_DST);
+		command = EDU_DMA_START | EDU_DMA_TO_RAM;
+	} else {
+		iowrite32((u32)edu->dma_handle, edu->bar + EDU_REG_DMA_SRC);
+		iowrite32(EDU_DMA_DEVICE_BUF, edu->bar + EDU_REG_DMA_DST);
+		command = EDU_DMA_START;
+	}
+
+	iowrite32(EDU_DMA_BUF_SIZE, edu->bar + EDU_REG_DMA_COUNT);
+
+	// start DMA, then wait until the device clears the start bit
+	iowrite32(command, edu->bar + EDU_REG_DMA_CMD);
+	return readl_poll_timeout(edu->bar + EDU_REG_DMA_CMD, status,
+				  !(status & EDU_DMA_START),
+				  1000, 1000000);
+}
+
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     // probe order/flow: enable -> hold from others -> map
     struct edu_device *edu;
@@ -62,6 +94,8 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	u32 liveness;
 	int ret;
     u32 factorial;
+    u8 *buf;
+    int i;
 
     // allocate data for this device; automatically freed when probe fails or device is removed
 	edu = devm_kzalloc(&pdev->dev, sizeof(*edu), GFP_KERNEL);
@@ -187,8 +221,41 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 	factorial = ioread32(edu->bar + EDU_REG_FACTORIAL);
 	dev_info(&pdev->dev, "factorial: 5! = %u (MSI)\n", factorial);
 
+    // ifll guest RAM with a known pattern
+    buf = edu->dma_buf;
+    for(i = 0; i < EDU_DMA_BUF_SIZE; i++)   buf[i] = i;
+
+    // copy guest RAM -> edu's internal buffer
+	ret = edu_dma_transfer(edu, false);
+	if (ret)
+		goto dma_timeout;
+
+	// clear guest RAM so the next transfer must restore the pattern
+	memset(buf, 0, EDU_DMA_BUF_SIZE);
+
+	// copy edu's internal buffer -> guest RAM
+	ret = edu_dma_transfer(edu, true);
+	if (ret)
+		goto dma_timeout;
+
+	// verify every byte came back correctly
+	for (i = 0; i < EDU_DMA_BUF_SIZE; i++) {
+		if (buf[i] != i) {
+			dev_err(&pdev->dev, "DMA mismatch at byte %d\n", i);
+			ret = -EIO;
+			goto free_irq;
+		}
+	}
+	dev_info(&pdev->dev, "DMA round trip: %d bytes verified\n",
+		 EDU_DMA_BUF_SIZE);
+
     return 0; // sucess: keep the resources until remove is called
 
+dma_timeout:
+    // transfer might still be using the buffer; retain it until guest reboot
+    edu->dma_stuck = true;
+    dev_err(&pdev->dev, "DMA timed out; reboot guest before retrying\n");
+    goto free_irq;
 free_irq:
 	// stop requesting factorial interrupts before freeing the handler
 	iowrite32(0, edu->bar + EDU_REG_STATUS);
@@ -200,14 +267,11 @@ unmap_bar:
 release_region:
 	pci_release_region(pdev, EDU_BAR);
 free_dma:
-    dma_free_coherent(&pdev->dev, EDU_DMA_BUF_SIZE, edu->dma_buf, edu->dma_handle);
+    if (!edu->dma_stuck)
+        dma_free_coherent(&pdev->dev, EDU_DMA_BUF_SIZE, edu->dma_buf, edu->dma_handle);
 disable_device:
 	pci_disable_device(pdev);
 	return ret;
-
-    // NO LONGER ACCESSIBLE
-    // dev_info(&pdev->dev, "svnu: edu device found\n");
-    // return 0;
 }
 
 static void edu_remove(struct pci_dev *pdev) {

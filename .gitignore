@@ -2,3 +2,12 @@
 /build/
 /rootfs/bin/busybox
 /initramfs.cpio.gz
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+/tmp_versions/
+boot.log

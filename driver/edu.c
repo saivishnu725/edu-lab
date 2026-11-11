@@ -8,6 +8,7 @@
 #include <linux/completion.h>
 #include <linux/interrupt.h>
 #include <linux/slab.h>
+#include <linux/jiffies.h>
 
 #define EDU_BAR             0           // I/O memory, 1 MB in size. Users are supposed to communicate with the card through this memory
 #define EDU_REG_ID          0x00        // specs says device version and identifier stays in this register
@@ -18,6 +19,10 @@
 #define EDU_REG_FACTORIAL  0x08
 #define EDU_REG_STATUS     0x20
 #define EDU_STATUS_BUSY    0x01
+#define EDU_STATUS_IRQ_ENABLE  0x80  // ask device to interrupt when factorial finishes
+#define EDU_REG_IRQ_STATUS     0x24  // tells us which interrupt was raised
+#define EDU_REG_IRQ_ACK        0x64  // write interrupt bits here to acknowledge them
+#define EDU_IRQ_FACTORIAL      0x01  // factorial completion interrupt bit
 
 // data for one edu device, shared by probe, interrupt handler and remove
 struct edu_device {
@@ -26,13 +31,32 @@ struct edu_device {
 	int irq;                           // Linux IRQ number assigned to the device
 };
 
+// kernel calls this fn in an interrupt thread
+static irqreturn_t edu_irq_thread(int irq, void *data)
+{
+	struct edu_device *edu = data;
+	u32 status;
+
+	// find out which interrupt the device raised
+	status = ioread32(edu->bar + EDU_REG_IRQ_STATUS);
+	if (!status)
+		return IRQ_NONE;
+
+	// tell the device we handled the interrupt
+	iowrite32(status, edu->bar + EDU_REG_IRQ_ACK);
+
+	if (status & EDU_IRQ_FACTORIAL)
+		complete(&edu->factorial_done);  // wake the waiting probe
+
+	return IRQ_HANDLED;
+}
+
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     // probe order/flow: enable -> hold from others -> map
     struct edu_device *edu;
 	u32 device_id;
 	u32 liveness;
 	int ret;
-    u32 status;
     u32 factorial;
 
     // allocate data for this device; automatically freed when probe fails or device is removed
@@ -48,6 +72,9 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 		dev_err(&pdev->dev, "failed to enable PCI device: %d\n", ret);
 		return ret;
 	}
+
+    // allow the device to initiate PCI transactions, including MSI writes
+	pci_set_master(pdev);
 
     // claim BAR0 so another driver cannot claim the same resource
 	ret = pci_request_region(pdev, EDU_BAR, "edu");
@@ -69,6 +96,23 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     // stores mapping with the device so edu_remove() can unmap it
 	pci_set_drvdata(pdev, edu);
 
+    // allocate one MSI interrupt vector
+	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "failed to allocate MSI: %d\n", ret);
+		goto unmap_bar;
+	}
+
+	edu->irq = pci_irq_vector(pdev, 0);
+
+	// register a threaded handler for that interrupt
+	ret = request_threaded_irq(edu->irq, NULL, edu_irq_thread,
+				   IRQF_ONESHOT, "edu", edu);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to request IRQ: %d\n", ret);
+		goto free_vectors;
+	}
+
     // 0x00 (RO) identification
     // Value is in the form 0xRRrr00edu where: - RR – major version - rr – minor version
 	device_id = ioread32(edu->bar + EDU_REG_ID);
@@ -84,8 +128,8 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
 
     // 0x08 (RW)factorial computation
     // The stored value is taken and factorial of it is put back here. This happens only after factorial bit in the status register (0x20 below) is cleared.
+    /*
     iowrite32(5, edu->bar + EDU_REG_FACTORIAL);
-
     // check status
 	ret = readl_poll_timeout(edu->bar + EDU_REG_STATUS, status,
 				 !(status & EDU_STATUS_BUSY),
@@ -98,9 +142,33 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     // read the factorial
 	factorial = ioread32(edu->bar + EDU_REG_FACTORIAL);
 	dev_info(&pdev->dev, "factorial: 5! = %u\n", factorial);
+    */
+    // enable the device's factorial completion interrupt
+	iowrite32(EDU_STATUS_IRQ_ENABLE, edu->bar + EDU_REG_STATUS);
+
+	// start the calculation
+	iowrite32(5, edu->bar + EDU_REG_FACTORIAL);
+
+	// sleep until the interrupt handler signals us, or one second passes
+	if (!wait_for_completion_timeout(&edu->factorial_done,
+					 msecs_to_jiffies(1000))) {
+		dev_err(&pdev->dev, "factorial interrupt timed out\n");
+		ret = -ETIMEDOUT;
+		goto free_irq;
+	}
+
+    // read the factorial after waking up
+	factorial = ioread32(edu->bar + EDU_REG_FACTORIAL);
+	dev_info(&pdev->dev, "factorial: 5! = %u (MSI)\n", factorial);
 
     return 0; // sucess: keep the resources until remove is called
 
+free_irq:
+	// stop requesting factorial interrupts before freeing the handler
+	iowrite32(0, edu->bar + EDU_REG_STATUS);
+	free_irq(edu->irq, edu);
+free_vectors:
+	pci_free_irq_vectors(pdev);
 unmap_bar:
     pci_iounmap(pdev, edu->bar);
 release_region:
@@ -119,8 +187,13 @@ static void edu_remove(struct pci_dev *pdev) {
 
     // retrieve the data we stored in probe
 	struct edu_device *edu = pci_get_drvdata(pdev);
-
-	pci_iounmap(pdev, edu->bar);
+    
+    // disable device interrupts, then free the handler and MSI vector
+	iowrite32(0, edu->bar + EDU_REG_STATUS);
+	free_irq(edu->irq, edu);
+	pci_free_irq_vectors(pdev);
+	
+    pci_iounmap(pdev, edu->bar);
 	pci_release_region(pdev, EDU_BAR);
 	pci_disable_device(pdev);
 

@@ -1,0 +1,11 @@
+#!/bin/busybox sh
+
+set -x
+/bin/busybox --install -s   # create symlinks: ls, sh, lspci, insmod and more
+mount -t proc   none    /proc       # process info, /proc.interrupts
+mount -t sysfs  none    /sys        # device tree: /sys/bus/pci/...
+mount -t devtmpfs   none    /dev    # device nodes, /dev/edu0
+
+echo "svnu edu lab up"
+
+exec setsid cttyhack sh     # shell with a proper controlling tty (Ctrl+C works)

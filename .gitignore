@@ -1,0 +1,4 @@
+/linux/
+/build/
+/rootfs/bin/busybox
+/initramfs.cpio.gz

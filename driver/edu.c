@@ -9,6 +9,7 @@
 #include <linux/interrupt.h>
 #include <linux/slab.h>
 #include <linux/jiffies.h>
+#include <linux/dma-mapping.h>
 
 #define EDU_BAR             0           // I/O memory, 1 MB in size. Users are supposed to communicate with the card through this memory
 #define EDU_REG_ID          0x00        // specs says device version and identifier stays in this register
@@ -23,12 +24,15 @@
 #define EDU_REG_IRQ_STATUS     0x24  // tells us which interrupt was raised
 #define EDU_REG_IRQ_ACK        0x64  // write interrupt bits here to acknowledge them
 #define EDU_IRQ_FACTORIAL      0x01  // factorial completion interrupt bit
+#define EDU_DMA_BUF_SIZE  64  // bytes in our first DMA buffer
 
 // data for one edu device, shared by probe, interrupt handler and remove
 struct edu_device {
 	void __iomem *bar;                 // mapped BAR0; use bar + offset to access registers
 	struct completion factorial_done;  // lets probe wait for factorial to finish
 	int irq;                           // Linux IRQ number assigned to the device
+    void *dma_buf;           // CPU pointer for accessing the buffer
+	dma_addr_t dma_handle;   // DMA address to give to the device
 };
 
 // kernel calls this fn in an interrupt thread
@@ -76,11 +80,33 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
     // allow the device to initiate PCI transactions, including MSI writes
 	pci_set_master(pdev);
 
+    // edu supports 28-bit DMA addresses by default
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(28));
+	if (ret) {
+        // specsheet:
+        // For educational purposes, the device supports only 28 bits (256 MiB) by default
+        // Students shall set dma_mask for the device in the OS driver properly
+		dev_err(&pdev->dev, "28-bit DMA is not available: %d\n", ret);
+		goto disable_device;
+	}
+
+    // allocate memory accessible to both the CPU and the device
+	edu->dma_buf = dma_alloc_coherent(&pdev->dev, EDU_DMA_BUF_SIZE,
+					  &edu->dma_handle, GFP_KERNEL);
+	if (!edu->dma_buf) {
+		dev_err(&pdev->dev, "failed to allocate DMA buffer\n");
+		ret = -ENOMEM;
+		goto disable_device;
+	}
+
+	dev_info(&pdev->dev, "allocated %d-byte DMA buffer, DMA address: %pad\n",
+		 EDU_DMA_BUF_SIZE, &edu->dma_handle);
+
     // claim BAR0 so another driver cannot claim the same resource
 	ret = pci_request_region(pdev, EDU_BAR, "edu");
 	if (ret) {
 		dev_err(&pdev->dev, "failed to claim BAR0: %d\n", ret);
-		goto disable_device;
+		goto free_dma;
 	}
 
     // mapping that a kernel can use to access it
@@ -173,6 +199,8 @@ unmap_bar:
     pci_iounmap(pdev, edu->bar);
 release_region:
 	pci_release_region(pdev, EDU_BAR);
+free_dma:
+    dma_free_coherent(&pdev->dev, EDU_DMA_BUF_SIZE, edu->dma_buf, edu->dma_handle);
 disable_device:
 	pci_disable_device(pdev);
 	return ret;
@@ -195,6 +223,7 @@ static void edu_remove(struct pci_dev *pdev) {
 	
     pci_iounmap(pdev, edu->bar);
 	pci_release_region(pdev, EDU_BAR);
+    dma_free_coherent(&pdev->dev, EDU_DMA_BUF_SIZE, edu->dma_buf, edu->dma_handle);
 	pci_disable_device(pdev);
 
     dev_info(&pdev->dev, "svnu: edu device removed\n");
